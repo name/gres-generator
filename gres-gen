@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly VERSION="1.0.0"
+
+declare -g device_name="gpu"
+declare -g header_file=""
+declare -g autodetect_option=""
+declare -g show_help=false
+
+detect_hardware() {
+    local gpu_count
+    local cpu_count
+    
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "Error: nvidia-smi not found. NVIDIA drivers may not be installed." >&2
+        exit 1
+    fi
+    
+    gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l)
+    cpu_count=$(nproc)
+    
+    if [[ $gpu_count -eq 0 ]]; then
+        echo "Warning: No GPUs detected" >&2
+    fi
+    
+    echo "$gpu_count $cpu_count"
+}
+
+show_usage() {
+    cat << EOF
+$SCRIPT_NAME v$VERSION - Generate SLURM GRES configuration for GPU resources
+
+USAGE:
+    $SCRIPT_NAME [OPTIONS]
+
+OPTIONS:
+    -n, --name DEVICE     Device name in GRES config (default: gpu)
+    -h, --header FILE     Include header file content at top
+    -a, --autodetect OPT  Add AutoDetect line with specified option
+    --help                Show this help message
+    --version             Show version information
+
+EXAMPLES:
+    $SCRIPT_NAME
+    $SCRIPT_NAME --name tesla --header /etc/slurm/gres_header.conf
+    $SCRIPT_NAME --autodetect nvml
+
+OUTPUT:
+    Generates GRES configuration mapping each GPU to balanced CPU core ranges
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $VERSION"
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -n|--name)
+                [[ -n ${2:-} ]] || { echo "Error: --name requires a value" >&2; exit 1; }
+                device_name="$2"
+                shift 2
+                ;;
+            -h|--header)
+                [[ -n ${2:-} ]] || { echo "Error: --header requires a file path" >&2; exit 1; }
+                header_file="$2"
+                shift 2
+                ;;
+            -a|--autodetect)
+                [[ -n ${2:-} ]] || { echo "Error: --autodetect requires a value" >&2; exit 1; }
+                autodetect_option="$2"
+                shift 2
+                ;;
+            --help)
+                show_help=true
+                shift
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option '$1'" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+include_header() {
+    [[ -z $header_file ]] && return 0
+    
+    if [[ ! -f $header_file ]]; then
+        echo "Error: Header file '$header_file' not found" >&2
+        exit 1
+    fi
+    
+    if [[ ! -r $header_file ]]; then
+        echo "Error: Header file '$header_file' not readable" >&2
+        exit 1
+    fi
+    
+    cat "$header_file"
+    echo
+}
+
+calculate_cpu_range() {
+    local gpu_id=$1
+    local total_gpus=$2
+    local total_cores=$3
+    
+    local cores_per_gpu=$((total_cores / total_gpus))
+    local start_core=$((gpu_id * cores_per_gpu))
+    local end_core=$(((gpu_id + 1) * cores_per_gpu - 1))
+    
+    if [[ $gpu_id -eq $((total_gpus - 1)) ]]; then
+        end_core=$((total_cores - 1))
+    fi
+    
+    echo "$start_core-$end_core"
+}
+
+generate_gres_config() {
+    local hardware_info
+    local gpu_count
+    local cpu_count
+    
+    hardware_info=$(detect_hardware)
+    read -r gpu_count cpu_count <<< "$hardware_info"
+    
+    include_header
+    
+    for gpu_id in $(seq 0 $((gpu_count - 1))); do
+        local cpu_range
+        cpu_range=$(calculate_cpu_range "$gpu_id" "$gpu_count" "$cpu_count")
+        printf "Name=%-10s File=/dev/nvidia%d CPUs=%s\n" \
+            "$device_name" "$gpu_id" "$cpu_range"
+    done
+    
+    if [[ -n $autodetect_option ]]; then
+        echo
+        echo "AutoDetect=$autodetect_option"
+    fi
+}
+
+main() {
+    parse_arguments "$@"
+    
+    if [[ $show_help == true ]]; then
+        show_usage
+        exit 0
+    fi
+    
+    generate_gres_config
+}
+
+main "$@"
